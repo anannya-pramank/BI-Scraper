@@ -1,0 +1,282 @@
+import requests
+from bs4 import BeautifulSoup
+from pathlib import Path
+from datetime import datetime
+import hashlib
+import csv
+import json
+import re
+
+
+# ================= CONFIG =================
+
+DATA_DIR        = Path("trilegal")
+IND_CSV         = DATA_DIR / "trilegal_industries_master.csv"
+IND_JSON        = DATA_DIR / "trilegal_industries_new.json"
+
+TRILEGAL_BASE   = "https://trilegal.com"
+INDUSTRIES_URL  = f"{TRILEGAL_BASE}/industries/"
+
+HARD_CAP        = 80_000
+
+HEADERS = {
+    "User-Agent":      "Mozilla/5.0 (compatible; TrilegalBot/1.0)",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+SUMMARY_QUERIES = [
+    "What does the firm do in this industry and what services does it offer?",
+    "What is the regulatory and market context for this sector?",
+    "Who are the clients and what kind of matters are handled?",
+    "What is the firm's experience and track record in this sector?",
+]
+
+_st_model = None
+
+
+# ================= SEMANTIC EXTRACTION =================
+
+def _get_model():
+    global _st_model
+    if _st_model is None:
+        from sentence_transformers import SentenceTransformer
+        print("  Loading semantic model …")
+        _st_model = SentenceTransformer("all-MiniLM-L6-v2")
+        print("  Model ready.")
+    return _st_model
+
+
+def semantic_extract(full_text: str) -> str:
+    chunks = [c.strip() for c in re.split(r"\n{2,}", full_text) if len(c.strip()) > 80]
+
+    if not chunks:
+        return full_text[:HARD_CAP]
+
+    total = sum(len(c) for c in chunks)
+    if total <= HARD_CAP:
+        return full_text
+
+    try:
+        import numpy as np
+        model = _get_model()
+
+        chunk_embs = model.encode(chunks,          show_progress_bar=False, batch_size=64)
+        query_embs = model.encode(SUMMARY_QUERIES, show_progress_bar=False)
+
+        chunk_unit = chunk_embs / (np.linalg.norm(chunk_embs, axis=1, keepdims=True) + 1e-8)
+        scores     = np.zeros(len(chunks))
+
+        for q_emb in query_embs:
+            q_unit = q_emb / (np.linalg.norm(q_emb) + 1e-8)
+            scores = np.maximum(scores, chunk_unit @ q_unit)
+
+        threshold = 0.35 * scores.max()
+        selected  = []
+        used      = 0
+
+        for idx in range(len(chunks)):
+            if scores[idx] >= threshold and used + len(chunks[idx]) <= HARD_CAP:
+                selected.append(idx)
+                used += len(chunks[idx])
+
+        if not selected:
+            selected = sorted(int(i) for i in np.argsort(scores)[::-1][:10])
+            used = sum(len(chunks[i]) for i in selected)
+
+        result = "\n\n".join(chunks[i] for i in selected)
+        print(f"  Semantic selection: {len(selected)}/{len(chunks)} chunks "
+              f"({used:,} chars from {total:,} total, threshold={threshold:.3f})")
+        return result
+
+    except Exception as e:
+        print(f"  [Semantic extract fallback] {e}")
+        return full_text[:HARD_CAP]
+
+
+# ================= HELPERS =================
+
+def make_id(url: str) -> str:
+    return hashlib.sha1(url.encode()).hexdigest()[:16]
+
+
+def clean(el) -> str:
+    return re.sub(r"\s+", " ", el.get_text(" ", strip=True))
+
+
+def absolute_url(href: str) -> str:
+    href = href.strip()
+    return href if href.startswith("http") else TRILEGAL_BASE + "/" + href.lstrip("/")
+
+
+# ================= INDUSTRY DETAIL EXTRACTION =================
+
+def extract_detail(detail_url: str) -> dict:
+    """Fetch an industry detail page and pull the body text + client list."""
+    try:
+        resp = requests.get(detail_url, headers=HEADERS, timeout=30)
+        if resp.status_code != 200:
+            return {"intro": "", "body_text": "", "clients": []}
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Main heading
+        h1 = soup.find("h1")
+
+        # Collect paragraphs until the "Related Industries" section.
+        # Strip out nav/footer boilerplate by only taking <p> and <li> within <main>/<article>
+        # if present, otherwise fall back to the whole document.
+        container = soup.find("main") or soup.find("article") or soup
+
+        paras = []
+        clients = []
+        in_client_list = False
+
+        for el in container.find_all(["h1", "h2", "h3", "p", "li"]):
+            text = clean(el)
+            low  = text.lower()
+
+            # Stop once we hit the related-industries / footer area
+            if el.name in ("h2", "h3") and ("related industries" in low or "quick links" in low):
+                break
+
+            if el.name == "p":
+                if text:
+                    paras.append(text)
+                if "clients in this space" in low or "some of our clients" in low:
+                    in_client_list = True
+                else:
+                    in_client_list = False
+            elif el.name == "li" and in_client_list:
+                if text:
+                    clients.append(text)
+
+        intro = paras[0] if paras else ""
+        body_text = "\n\n".join(paras)
+
+        return {
+            "intro":     intro,
+            "body_text": semantic_extract(body_text),
+            "clients":   clients,
+        }
+
+    except Exception as e:
+        print(f"  [Detail extract error] {detail_url}: {e}")
+        return {"intro": "", "body_text": "", "clients": []}
+
+
+# ================= INDEX SCRAPER =================
+
+def scrape_industries() -> list:
+    resp = requests.get(INDUSTRIES_URL, headers=HEADERS, timeout=30)
+    resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    results = []
+    seen = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        # Industry detail links look like /industries/<slug>/ but are NOT the index itself
+        m = re.match(r"^https?://trilegal\.com/industries/(.+?)/?$", href)
+        if not m:
+            continue
+        slug = m.group(1).strip("/")
+        if not slug or "/" in slug:        # skip the index page and any nested paths
+            continue
+
+        url = absolute_url(href)
+        if url in seen:
+            continue
+        seen.add(url)
+
+        # The link text concatenates image alt + name + blurb; derive a name heuristically.
+        raw = clean(a)
+        # Drop trailing "See More..." and image-alt prefixes where possible
+        raw = re.sub(r"see more\.*\s*$", "", raw, flags=re.I).strip()
+
+        results.append({
+            "slug":       slug,
+            "name_hint":  raw,
+            "detail_url": url,
+        })
+
+    return results
+
+
+# ================= CSV HELPERS =================
+
+def ensure_csv(csv_path: Path, fieldnames: list):
+    DATA_DIR.mkdir(exist_ok=True)
+    if not csv_path.exists():
+        with csv_path.open("w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(fieldnames)
+
+
+def load_ids(csv_path: Path) -> set:
+    if not csv_path.exists():
+        return set()
+    with csv_path.open(encoding="utf-8") as f:
+        return {r["id"] for r in csv.DictReader(f)}
+
+
+def append_to_csv(csv_path: Path, rows: list, fieldnames: list):
+    with csv_path.open("a", newline="", encoding="utf-8") as f:
+        csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore").writerows(rows)
+
+
+def write_json(json_path: Path, items: list):
+    json_path.write_text(
+        json.dumps(
+            {"generated_at": datetime.utcnow().isoformat(),
+             "count":        len(items),
+             "items":        items},
+            indent=2, ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+# ================= MAIN =================
+
+def main():
+    ind_fields = ["id", "slug", "title", "detail_url", "scraped_at"]
+    ensure_csv(IND_CSV, ind_fields)
+    existing_ids = load_ids(IND_CSV)
+
+    print("Scraping Trilegal industries index …")
+    scraped = scrape_industries()
+    print(f"  {len(scraped)} industry links on page")
+
+    new_items = []
+    for entry in scraped:
+        item_id = make_id(entry["detail_url"])
+        if item_id in existing_ids:
+            continue
+
+        print(f"\n  NEW industry: {entry['slug']}")
+        detail = extract_detail(entry["detail_url"])
+
+        # Prefer the detail page's H1-derived title; fall back to slug.
+        title = entry["slug"].replace("-", " ").title()
+
+        new_items.append({
+            "id":         item_id,
+            "slug":       entry["slug"],
+            "title":      title,
+            "detail_url": entry["detail_url"],
+            "intro":      detail["intro"],
+            "body_text":  detail["body_text"],
+            "clients":    detail["clients"],
+            "scraped_at": datetime.utcnow().isoformat(),
+        })
+
+    print(f"\n  New industries: {len(new_items)}")
+    if new_items:
+        append_to_csv(IND_CSV, new_items, ind_fields)
+        write_json(IND_JSON, new_items)
+
+    print("\nAll done.")
+
+
+if __name__ == "__main__":
+    main()
