@@ -217,6 +217,30 @@ def append_to_csv(csv_path: Path, rows: list, fieldnames: list):
         csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore").writerows(rows)
 
 
+CONTENT_FIELDS = ["title", "snippet", "clients", "detail_url"]
+
+
+def append_content_csv(csv_path: Path, items: list):
+    """Readable companion CSV: one row per item with title, snippet, and
+    marquee clients all in the same file. Appends new rows; header written once.
+
+    - snippet: the detail page's intro paragraph, falling back to the card teaser.
+    - clients: the marquee client list joined with '; ' into a single cell.
+    """
+    ensure_csv(csv_path, CONTENT_FIELDS)
+    rows = []
+    for it in items:
+        snippet = (it.get("intro") or it.get("teaser") or "").strip()
+        clients = "; ".join(it.get("clients") or [])
+        rows.append({
+            "title":      it.get("title", ""),
+            "snippet":    snippet,
+            "clients":    clients,
+            "detail_url": it.get("detail_url", ""),
+        })
+    append_to_csv(csv_path, rows, CONTENT_FIELDS)
+
+
 def write_json(json_path: Path, items: list):
     json_path.write_text(
         json.dumps(
@@ -270,5 +294,6 @@ def run_source(source) -> int:
     if new_items:
         append_to_csv(source.csv_path, new_items, csv_fields)
         write_json(source.json_path, new_items)
+        append_content_csv(source.content_csv_path, new_items)
 
     return len(new_items)
