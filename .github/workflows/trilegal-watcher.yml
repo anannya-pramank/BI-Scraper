@@ -1,0 +1,61 @@
+name: trilegal-watcher
+
+# Manual trigger for testing. A scheduled run is included but commented out —
+# uncomment the `schedule` block when you're ready to automate.
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Which source to scrape"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - industries
+          - expertise
+  # schedule:
+  #   - cron: "0 6 * * 1"   # every Monday 06:00 UTC
+
+permissions:
+  contents: write          # needed only if the commit step below is enabled
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run watcher
+        run: python -m trilegal_watcher "${{ github.event.inputs.source || 'all' }}"
+
+      - name: Upload results as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trilegal-data
+          path: trilegal/
+          if-no-files-found: warn
+
+      # Optional: commit updated state back to the repo so dedupe persists
+      # across scheduled runs. Enable by uncommenting. Requires the
+      # `contents: write` permission above and that `trilegal/` is NOT gitignored.
+      #
+      # - name: Commit updated data
+      #   run: |
+      #     git config user.name  "github-actions[bot]"
+      #     git config user.email "github-actions[bot]@users.noreply.github.com"
+      #     git add trilegal/
+      #     git diff --staged --quiet || git commit -m "Update Trilegal data [skip ci]"
+      #     git push
